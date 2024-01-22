@@ -5,7 +5,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/robfig/cron/v3"
@@ -36,7 +38,7 @@ func main() {
 
 	cronInterval := os.Getenv("CRON_INTERVAL")
 	if cronInterval == "" {
-		cronInterval = "@every 1m" 
+		cronInterval = "@every 1m"
 	}
 
 	// Connect to MongoDB
@@ -70,14 +72,83 @@ func main() {
 }
 
 func processAndLogSummary(client *mongo.Client, dbName, collectionName string) {
+	var wg sync.WaitGroup
+
 	collection := client.Database(dbName).Collection(collectionName)
 
-	// Count the number of users in the database
-	count, err := collection.CountDocuments(context.Background(), bson.D{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		count, err := collection.CountDocuments(context.Background(), bson.D{})
+		if err != nil {
+			log.Println("Error counting users:", err)
+			return
+		}
+
+		log.Printf("Summary Statistics - Total Users: %d\n", count)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logChangesPeriodically(collection)
+	}()
+
+	wg.Wait()
+}
+
+func logChangesPeriodically(collection *mongo.Collection) {
+	lastCount, err := collection.CountDocuments(context.Background(), bson.D{})
 	if err != nil {
 		log.Println("Error counting users:", err)
 		return
 	}
 
-	log.Printf("Summary Statistics - Total Users: %d\n", count)
+	for {
+		time.Sleep(1 * time.Minute) // Adjust the interval as needed
+
+		currentCount, err := collection.CountDocuments(context.Background(), bson.D{})
+		if err != nil {
+			log.Println("Error counting users:", err)
+			continue
+		}
+
+		if currentCount != lastCount {
+			newUsers, err := getNewUsers(collection, lastCount)
+			if err != nil {
+				log.Println("Error fetching new users:", err)
+				continue
+			}
+
+			log.Printf("User count changed. Previous Count: %d, Current Count: %d\n", lastCount, currentCount)
+			logNewUsers(newUsers)
+			lastCount = currentCount
+		}
+	}
+}
+
+func getNewUsers(collection *mongo.Collection, lastCount int64) ([]bson.M, error) {
+	cursor, err := collection.Find(context.Background(), bson.D{})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(context.Background())
+
+	var newUsers []bson.M
+	for cursor.Next(context.Background()) {
+		var user bson.M
+		if err := cursor.Decode(&user); err != nil {
+			return nil, err
+		}
+		newUsers = append(newUsers, user)
+	}
+
+	// Only return the new users since the last count
+	return newUsers[int(lastCount):], nil
+}
+
+func logNewUsers(users []bson.M) {
+	for _, user := range users {
+		log.Println("New user added:", user)
+	}
 }
